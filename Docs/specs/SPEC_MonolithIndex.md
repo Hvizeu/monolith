@@ -8,7 +8,7 @@
 
 ## MonolithIndex
 
-**Dependencies:** Core, CoreUObject, Engine, MonolithCore, UnrealEd, AssetRegistry, Json, JsonUtilities, SQLiteCore, Slate, SlateCore, BlueprintGraph, KismetCompiler, EditorSubsystem
+**Dependencies:** Core, CoreUObject, Engine, MonolithCore, UnrealEd, AssetRegistry, Json, JsonUtilities, SQLiteCore, Slate, SlateCore, BlueprintGraph, KismetCompiler, EditorSubsystem, RenderCore, RHI
 
 ### Classes
 
@@ -35,6 +35,12 @@
 
 > **`FUserDefinedStructIndexer` `<unresolved>` field guard (issue #70).** `FUserDefinedStructIndexer::IndexAsset` (`Indexers/UserDefinedStructIndexer.cpp`) previously called `FProperty::GetCPPType()` unconditionally while indexing UDS fields. Several property subclasses dereference their inner type pointer inside `GetCPPType()` with no null guard, so a field whose type can no longer resolve — e.g. a `TSubclassOf<X>` pointing at a deleted Blueprint, leaving `MetaClass` null — asserted (`check(MetaClass)`, `PropertyClass.cpp:160`) and took the editor down mid deep-index. A file-local `SafeGetCPPType` helper now returns `GetCPPType()` for every well-formed property and a `<unresolved>` placeholder only when the inner pointer the assert would dereference is null. It covers the verified asserting paths: `FObjectProperty`/`FSoftObjectProperty` (`PropertyClass`), `FClassProperty`/`FSoftClassProperty` (`MetaClass`/`PropertyClass`), `FStructProperty` (`Struct`), and `FEnumProperty` (`GetEnum()`); `FByteProperty` already null-guards internally. Both the JSON `type` field and the indexed-variable `VarType` route through the helper, so a broken field indexes as `<unresolved>` instead of crashing. Behavior is identical for all well-formed properties.
 
+**Level scheduling and cleanup.** `FLevelIndexer` loads one root map per game-thread dispatch, independent of `PostPassBatchSize`. Returning after each map gives the editor a normal tick before the next load and keeps the existing stop-aware claim/abort behavior. The load capture includes linked-level packages. Compilation finishes before teardown. Resident, rooted, dirty, editor, script, and compiled-in packages are protected; `RF_Standalone` is restored on surviving objects. Landscape components are unregistered before `CleanupWorld`, and non-landscape World Partition worlds are uninitialized before collection. Garbage collection and deferred render/RHI work finish before the next map is admitted.
+
+**Memory admission.** The indexer samples process memory, system RAM headroom, and GPU budget before and after each load. The first pressure result runs cleanup and returns to the editor loop. Sustained critical pressure or deferred cleanup blocks the next map and leaves the full index resumable. The existing metadata table stores `level_index_state` while the pass is active, partial, failed, or pressure-degraded; `project get_stats` reports it, and successful completion removes it. UE 5.8 uses RHI budget statistics. UE 5.7 uses the texture-memory estimate. Missing GPU telemetry is ignored.
+
+**Actor rows.** Rows are assembled before writing and replaced in one SQLite transaction per inspected world. Inserts and commits are checked, so a failed replacement leaves the world's old rows intact. A successful empty result clears the old rows. Linked worlds processed through a parent load are skipped when their own Asset Registry entry is reached.
+
 ### Actions (12 — namespace: "project")
 
 | Action | Params | Description |
@@ -42,7 +48,7 @@
 | `search` | `query` (required, max 4096 chars), `limit` (50, clamped 1-1000), `asset_class` (string or array, optional) | FTS5 full-text search over the `fts_assets` and `fts_nodes` columns. **Not** variables or parameters — those are structured rows, reachable via `get_asset_details`. See **Search Error Contract** and **`asset_class` filter** below |
 | `find_references` | `asset_path` (required) | Bidirectional dependency lookup |
 | `find_by_type` | `asset_type` (required), `limit` (100), `offset` (0) | Filter assets by class with pagination |
-| `get_stats` | none | Row counts for all 13 tables + asset class breakdown (top 20) + `skipped_assets` / `skipped_asset_paths` (assets the poison-pill rule dropped from deep indexing — see **Full-Index Resume**) |
+| `get_stats` | none | Row counts for all 13 tables + asset class breakdown (top 20) + `skipped_assets` / `skipped_asset_paths` (assets the poison-pill rule dropped from deep indexing — see **Full-Index Resume**) + conditional `level_index_state` while level indexing is interrupted, partial, failed, or pressure-degraded |
 | `get_asset_details` | `asset_path` (required) | Deep inspection: nodes, variables, references for a single asset |
 | `list_gameplay_tags` | `prefix` (optional) | List indexed gameplay tags, optionally filtered by prefix |
 | `search_gameplay_tags` | `query` (required) | Search gameplay tags and return referencing assets |
@@ -232,7 +238,7 @@ At two interrupted attempts an asset is dropped from the deep queue and stamped 
 **`bDeferFirstTimeIndex` is honoured on resume.** That flag is the documented escape hatch for the UE 5.7 incremental-GC worker-context crash class, which is exactly the crash class an interrupted index is evidence of. Bypassing it on the resume path would override the user's escape hatch at the moment they need it, leaving them to delete `ProjectIndex.db` by hand. The startup path logs that an interrupted index is pending and waits for `Monolith.StartIndex`; checkpoints are durable, so waiting costs nothing.
 
 **Limits — what resume does NOT cover.**
-- **Post-pass sentinels always re-run from the start.** `FAnimationIndexer` operates on the `__Animations__` sentinel rather than on `assets` rows with ids, so `deep_indexed_hash` / `deep_index_attempts` do not apply to it; the same holds for the dependency, level, DataTable, config, C++, gameplay-tag and Niagara passes. A resume therefore repeats whichever post-pass work the interrupted run had done, and those indexers append rather than replace — so an interruption **during the post-pass phase** (as opposed to the far longer deep pass, where crashes normally happen) leaves duplicate `dependencies` / `actors` / `configs` / `cpp_symbols` / `tag_references` rows and duplicate animation nodes. `monolith_reindex force=true` clears them. Per-indexer post-pass checkpointing is tracked in `MISSING_FEATURES.md`.
+- **Post-pass sentinels always re-run from the start.** `FAnimationIndexer` operates on the `__Animations__` sentinel rather than on `assets` rows with ids, so `deep_indexed_hash` / `deep_index_attempts` do not apply to it; the same holds for the dependency, level, DataTable, config, C++, gameplay-tag and Niagara passes. A resume repeats any post-pass work already completed. The level pass replaces its own `actors` rows, so rerunning it does not duplicate them. Other sentinels still append, and an interrupted post-pass can duplicate `dependencies`, `configs`, `cpp_symbols`, `tag_references`, and animation nodes. `monolith_reindex force=true` clears them. Per-indexer post-pass checkpointing is tracked in `MISSING_FEATURES.md`.
 - The animation pass gets **per-batch transactions** (bounding an interruption's loss to one batch instead of the whole pass) but no checkpoint and no poison protection; its SEH guard already isolates per-asset crashes.
 - `monolith_reindex()` with no arguments on an interrupted index still takes the full-reset path (`CanDoIncrementalIndex()` requires `last_full_index`, which an interrupted run does not have). Use `Monolith.StartIndex` to resume.
 

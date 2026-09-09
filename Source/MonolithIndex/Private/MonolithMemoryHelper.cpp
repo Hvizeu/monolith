@@ -1,6 +1,14 @@
 #include "MonolithMemoryHelper.h"
+#include "DynamicRHI.h"
+#include "HAL/PlatformProcess.h"
 #include "HAL/PlatformMemory.h"
+#include "Misc/App.h"
+#include "RHICommandList.h"
+#include "RHIStats.h"
+#include "RenderingThread.h"
+#include "Runtime/Launch/Resources/Version.h"
 #include "UObject/Package.h"
+#include "UObject/UObjectHash.h"
 #include "UObject/UObjectGlobals.h"
 #include "UObject/GarbageCollection.h"
 #include "Engine/Engine.h"
@@ -12,12 +20,42 @@ namespace
 {
 	double LastGCTime = 0.0;
 	constexpr double MinGCIntervalSeconds = 0.5;
+	constexpr uint64 BytesPerMB = 1024ULL * 1024ULL;
+
+	void ForEachPackageObject(UPackage* Package, TFunctionRef<bool(UObject*)> Operation)
+	{
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8)
+		ForEachObjectWithPackage(Package, Operation, EGetObjectsFlags::IncludeNestedObjects);
+#else
+		ForEachObjectWithPackage(Package, Operation, true);
+#endif
+	}
+
+	void FlushPendingRenderingResources()
+	{
+		if (!IsInGameThread() || !FApp::CanEverRender() || !GDynamicRHI)
+		{
+			return;
+		}
+
+		FlushRenderingCommands();
+		ENQUEUE_RENDER_COMMAND(MonolithFlushPendingRHIResources)(
+			[](FRHICommandListImmediate& RHICmdList)
+			{
+				RHICmdList.ImmediateFlush(EImmediateFlushType::FlushRHIThreadFlushResources);
+			});
+		FlushRenderingCommands();
+	}
 }
 
 SIZE_T FMonolithMemoryHelper::GetCurrentMemoryUsageMB()
 {
-	FPlatformMemoryStats Stats = FPlatformMemory::GetStats();
-	return Stats.UsedPhysical / (1024 * 1024);
+	SIZE_T ProcessMemoryBytes = 0;
+	if (!FPlatformProcess::GetApplicationMemoryUsage(FPlatformProcess::GetCurrentProcessId(), &ProcessMemoryBytes))
+	{
+		return 0;
+	}
+	return ProcessMemoryBytes / BytesPerMB;
 }
 
 SIZE_T FMonolithMemoryHelper::GetAvailableMemoryMB()
@@ -28,8 +66,106 @@ SIZE_T FMonolithMemoryHelper::GetAvailableMemoryMB()
 
 bool FMonolithMemoryHelper::ShouldThrottle(SIZE_T BudgetMB)
 {
-	SIZE_T CurrentUsageMB = GetCurrentMemoryUsageMB();
-	return CurrentUsageMB > BudgetMB;
+	return ClassifyMemoryPressure(CaptureMemorySnapshot(false), BudgetMB) != EMonolithMemoryPressure::None;
+}
+
+FMonolithMemorySnapshot FMonolithMemoryHelper::CaptureMemorySnapshot(bool bIncludeGPUStats)
+{
+	const FPlatformMemoryStats PlatformStats = FPlatformMemory::GetStats();
+
+	FMonolithMemorySnapshot Snapshot;
+	Snapshot.ProcessPrivateMB = GetCurrentMemoryUsageMB();
+	Snapshot.AvailablePhysicalMB = PlatformStats.AvailablePhysical / BytesPerMB;
+	Snapshot.TotalPhysicalMB = PlatformStats.TotalPhysical / BytesPerMB;
+
+	if (!bIncludeGPUStats || !IsInGameThread() || !FApp::CanEverRender() || !GDynamicRHI)
+	{
+		return Snapshot;
+	}
+
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
+	FRHIMemoryStats RHIStats;
+	RHIGetMemoryStats(RHIStats);
+	if (RHIStats.BudgetLocal > 0)
+	{
+		Snapshot.GPUBudgetMB = RHIStats.BudgetLocal / BytesPerMB;
+		Snapshot.GPUUsedMB = RHIStats.UsedLocal / BytesPerMB;
+		Snapshot.bHasGPUStats = true;
+	}
+	else if (RHIStats.BudgetSystem > 0)
+	{
+		Snapshot.GPUBudgetMB = RHIStats.BudgetSystem / BytesPerMB;
+		Snapshot.GPUUsedMB = RHIStats.UsedSystem / BytesPerMB;
+		Snapshot.bHasGPUStats = true;
+	}
+#else
+	FTextureMemoryStats TextureStats;
+	RHIGetTextureMemoryStats(TextureStats);
+	const int64 DeviceMemory = TextureStats.GetTotalDeviceWorkingMemory();
+	if (DeviceMemory > 0)
+	{
+		Snapshot.GPUBudgetMB = static_cast<uint64>(DeviceMemory) / BytesPerMB;
+		Snapshot.GPUUsedMB = (TextureStats.StreamingMemorySize + TextureStats.NonStreamingMemorySize) / BytesPerMB;
+		Snapshot.bHasGPUStats = true;
+	}
+#endif
+
+	return Snapshot;
+}
+
+EMonolithMemoryPressure FMonolithMemoryHelper::ClassifyMemoryPressure(const FMonolithMemorySnapshot& Snapshot, SIZE_T BudgetMB)
+{
+	const uint64 CriticalPhysicalHeadroomMB = FMath::Clamp<uint64>(Snapshot.TotalPhysicalMB / 16, 1024, 2048);
+	const uint64 SoftPhysicalHeadroomMB = FMath::Clamp<uint64>(Snapshot.TotalPhysicalMB / 8, 2048, 4096);
+	if (Snapshot.AvailablePhysicalMB < CriticalPhysicalHeadroomMB)
+	{
+		return EMonolithMemoryPressure::Critical;
+	}
+
+	if (Snapshot.bHasGPUStats && Snapshot.GPUBudgetMB > 0)
+	{
+		const uint64 AvailableGPUMB = Snapshot.GPUUsedMB < Snapshot.GPUBudgetMB
+			? Snapshot.GPUBudgetMB - Snapshot.GPUUsedMB
+			: 0;
+		const uint64 CriticalGPUHeadroomMB = FMath::Max<uint64>(512, Snapshot.GPUBudgetMB / 10);
+		if (AvailableGPUMB < CriticalGPUHeadroomMB)
+		{
+			return EMonolithMemoryPressure::Critical;
+		}
+	}
+
+	if (Snapshot.ProcessPrivateMB > BudgetMB)
+	{
+		return EMonolithMemoryPressure::Soft;
+	}
+	if (Snapshot.AvailablePhysicalMB < SoftPhysicalHeadroomMB)
+	{
+		return EMonolithMemoryPressure::Soft;
+	}
+
+	if (Snapshot.bHasGPUStats && Snapshot.GPUBudgetMB > 0 &&
+		static_cast<double>(Snapshot.GPUUsedMB) / static_cast<double>(Snapshot.GPUBudgetMB) >= 0.85)
+	{
+		return EMonolithMemoryPressure::Soft;
+	}
+
+	return EMonolithMemoryPressure::None;
+}
+
+EMonolithMemoryPressureAction FMonolithMemoryHelper::GetPressureAction(
+	EMonolithMemoryPressure Pressure, bool bCleanupAttempted)
+{
+	if (Pressure == EMonolithMemoryPressure::None)
+	{
+		return EMonolithMemoryPressureAction::Proceed;
+	}
+	if (!bCleanupAttempted)
+	{
+		return EMonolithMemoryPressureAction::CleanupAndReassess;
+	}
+	return Pressure == EMonolithMemoryPressure::Critical
+		? EMonolithMemoryPressureAction::Stop
+		: EMonolithMemoryPressureAction::Proceed;
 }
 
 void FMonolithMemoryHelper::ForceGarbageCollection(bool bFullPurge)
@@ -62,6 +198,11 @@ void FMonolithMemoryHelper::ForceGarbageCollection(bool bFullPurge)
 	{
 		UE_LOG(LogMonolithMemory, Verbose, TEXT("TryCollectGarbage returned false - GC deferred by engine"));
 		return;
+	}
+
+	if (bFullPurge)
+	{
+		FlushPendingRenderingResources();
 	}
 }
 
@@ -100,6 +241,65 @@ bool FMonolithMemoryHelper::TryUnloadPackage(UObject* Asset, bool bWasAlreadyLoa
 	return true;
 }
 
+bool FMonolithMemoryHelper::ReleasePackagesLoadedForIndexing(const TArray<UPackage*>& Packages)
+{
+	if (!IsInGameThread() || IsGarbageCollecting())
+	{
+		UE_LOG(LogMonolithMemory, Warning, TEXT("Cannot release indexing packages while off the game thread or during GC"));
+		return false;
+	}
+
+	TArray<TWeakObjectPtr<UObject>> ClearedStandaloneObjects;
+	TSet<UPackage*> UniquePackages;
+	for (UPackage* Package : Packages)
+	{
+		if (!Package || Package == GetTransientPackage() || Package->IsRooted() || Package->IsDirty() ||
+			Package->HasAnyPackageFlags(PKG_ContainsScript | PKG_CompiledIn))
+		{
+			continue;
+		}
+		UniquePackages.Add(Package);
+	}
+
+	for (UPackage* Package : UniquePackages)
+	{
+		ForEachPackageObject(Package, [&ClearedStandaloneObjects](UObject* Object)
+		{
+			if (Object && !Object->IsRooted() && Object->HasAnyFlags(RF_Standalone))
+			{
+				Object->ClearFlags(RF_Standalone);
+				ClearedStandaloneObjects.Add(Object);
+			}
+			return true;
+		});
+
+		if (Package->HasAnyFlags(RF_Standalone))
+		{
+			Package->ClearFlags(RF_Standalone);
+			ClearedStandaloneObjects.Add(Package);
+		}
+	}
+
+	LastGCTime = FPlatformTime::Seconds();
+	const bool bCollected = TryCollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS, true);
+
+	// Restore RF_Standalone on survivors so a live package remains saveable.
+	for (const TWeakObjectPtr<UObject>& WeakObject : ClearedStandaloneObjects)
+	{
+		if (UObject* Object = WeakObject.Get())
+		{
+			Object->SetFlags(RF_Standalone);
+		}
+	}
+
+	FlushPendingRenderingResources();
+	if (!bCollected)
+	{
+		UE_LOG(LogMonolithMemory, Warning, TEXT("GC deferred while releasing %d indexing-owned packages"), UniquePackages.Num());
+	}
+	return bCollected;
+}
+
 void FMonolithMemoryHelper::YieldToEditor()
 {
 	if (!IsInGameThread())
@@ -107,43 +307,27 @@ void FMonolithMemoryHelper::YieldToEditor()
 		return;
 	}
 
-	// Intentional no-op seam (was a nested Slate tick).
-	//
-	// This function previously called FSlateApplication::Get().PumpMessages() +
-	// FSlateApplication::Get().Tick() to keep the editor responsive mid-batch.
-	// That re-entered the engine GC / asset-compiler flow from inside a
-	// worker-blocked game-thread lambda: on high-core-count machines the engine
-	// would spin up parallel GC worker contexts that never got freed across the
-	// nested re-entry, leaking one context per batch until the 64-context cap
-	// asserted ("Exceeded max active GC worker contexts", GarbageCollection.cpp:2133)
-	// during deep indexing of large (~17k-asset) projects.
-	//
-	// Yielding now happens naturally between batches: each batch payload is
-	// dispatched via FMonolithCompilerSafeDispatch's FTSTicker, runs on one real
-	// main-tick, and returns — releasing the worker thread's Event->Wait() and
-	// letting the editor tick normally on the genuine main loop between batches.
-	// The 12 call sites are kept (cheap game-thread guard) so this remains a safe
-	// documented seam for future yield-point needs.
+	// Do not tick Slate here. Nested editor ticks can re-enter garbage collection
+	// and asset compilation. Callers yield by returning to the editor loop.
 }
 
 void FMonolithMemoryHelper::LogMemoryStats(const FString& Context)
 {
-	FPlatformMemoryStats Stats = FPlatformMemory::GetStats();
-	
-	SIZE_T UsedMB = Stats.UsedPhysical / (1024 * 1024);
-	SIZE_T AvailableMB = Stats.AvailablePhysical / (1024 * 1024);
-	SIZE_T TotalMB = Stats.TotalPhysical / (1024 * 1024);
-	SIZE_T UsedVirtualMB = Stats.UsedVirtual / (1024 * 1024);
-
-	UE_LOG(LogMonolithMemory, Log, 
-		TEXT("[%s] Memory: Used=%llu MB, Available=%llu MB, Total=%llu MB, Virtual=%llu MB"),
-		*Context, UsedMB, AvailableMB, TotalMB, UsedVirtualMB);
+	const FMonolithMemorySnapshot Snapshot = CaptureMemorySnapshot(true);
+	UE_LOG(LogMonolithMemory, Log,
+		TEXT("[%s] Memory: Process=%llu MB, Available=%llu MB, Total=%llu MB, GPU=%llu/%llu MB%s"),
+		*Context,
+		Snapshot.ProcessPrivateMB,
+		Snapshot.AvailablePhysicalMB,
+		Snapshot.TotalPhysicalMB,
+		Snapshot.GPUUsedMB,
+		Snapshot.GPUBudgetMB,
+		Snapshot.bHasGPUStats ? TEXT("") : TEXT(" (GPU stats unavailable)"));
 }
 
 bool FMonolithMemoryHelper::IsMemoryCritical()
 {
-	constexpr SIZE_T CriticalThresholdMB = 2048; // 2GB
-	return GetAvailableMemoryMB() < CriticalThresholdMB;
+	return ClassifyMemoryPressure(CaptureMemorySnapshot(IsInGameThread()), GetResolvedMemoryBudgetMB()) == EMonolithMemoryPressure::Critical;
 }
 
 // ---- RAM tier auto-detect (v0.13.0) ----
@@ -177,7 +361,13 @@ namespace
 int32 FMonolithMemoryHelper::GetInstalledRamGB()
 {
 	const FPlatformMemoryStats Stats = FPlatformMemory::GetStats();
-	return static_cast<int32>(Stats.TotalPhysical / (1024ULL * 1024ULL * 1024ULL));
+	return RoundPhysicalBytesToRamGB(Stats.TotalPhysical);
+}
+
+int32 FMonolithMemoryHelper::RoundPhysicalBytesToRamGB(uint64 TotalPhysicalBytes)
+{
+	constexpr uint64 BytesPerGB = 1024ULL * 1024ULL * 1024ULL;
+	return static_cast<int32>((TotalPhysicalBytes + BytesPerGB / 2) / BytesPerGB);
 }
 
 int32 FMonolithMemoryHelper::GetResolvedMemoryBudgetMB()

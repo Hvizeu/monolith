@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Level indexing now loads and releases one map at a time. Actor rows are replaced in one transaction per world. Memory pressure triggers one cleanup pass; sustained critical pressure stops the pass and records `level_index_state` for the next resume.
+
 ## [0.23.0] - 2026-09-10
 
 Two new namespaces, `input` and `localization`, and a release built largely out of the gap between what an action *reported* and what it *did* — a Sound Cue edit that asserted instead of failing, an index that hung the editor on exit, a UI rebuild that reset properties it never mentioned, and instanced input modifiers that read back as `None` after a reload with nothing anywhere flagging the loss.
@@ -58,7 +62,6 @@ Two new namespaces, `input` and `localization`, and a release built largely out 
 
 - **Translation units are self-contained where they test the engine version.** Files that branch on `ENGINE_MAJOR_VERSION` / `ENGINE_MINOR_VERSION` now include a header that defines them rather than receiving them incidentally through the shared PCH. This is a mis-compile guard, not a build-error guard: an undefined identifier evaluates to `0` in `#if` **with no diagnostic**, so a broken include chain would silently compile the 5.7 branch into the 5.8 artifact. The material sampler API moved behind a shim for the same reason — UE 5.8 relocated `GetSamplerTypeForTexture` from `UMaterialExpressionTextureBase` into the `MaterialExpressionUtils` namespace, and 5.7 does not ship `MaterialExpressionUtils.h` at all, so the *include* has to be gated and not just the call. Both compat shims (`MonolithCoreDelegatesCompat.h`, `MonolithMaterialSamplerCompat.h`) live in `MonolithCore/Public` so the next 5.8 deprecation has one place to go.
 - **The native proxy build reports success only after the proxy is completely published.** Both `Tools/MonolithProxy` entry points compiled into the source tree, copied directly over `Binaries\monolith_proxy.exe`, left output-directory creation and publication unchecked, and printed success unconditionally — so a failed or partial publication could claim a usable binary while having damaged the existing one. The build now compiles into an invocation-owned private staging directory, copies the result beside the destination under a unique name and verifies its byte count, and only then renames the verified candidate over the target as the final step. A failure returns non-zero, prints no success, preserves the prior target, and removes its own candidate and staging directories. `build_proxy.bat` owns the workflow and `build.bat` delegates without altering its exit code. Verified against a regression harness on Windows PowerShell 5.1 and PowerShell 7, including injected compile failures and a locked publication target.
-
 ## [0.22.0] - 2026-08-01
 
 ### Internal

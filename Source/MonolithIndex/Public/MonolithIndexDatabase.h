@@ -260,6 +260,8 @@ public:
 
 	// --- Actor CRUD ---
 	int64 InsertActor(const FIndexedActor& Actor);
+	/** Atomically replace one world's actor rows. A failed insert or commit preserves the prior rows. */
+	bool ReplaceActorsForAsset(int64 AssetId, const TArray<FIndexedActor>& Actors);
 
 	// --- Tag CRUD ---
 	int64 InsertTag(const FIndexedTag& Tag);

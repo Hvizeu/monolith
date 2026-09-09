@@ -753,6 +753,45 @@ int64 FMonolithIndexDatabase::InsertActor(const FIndexedActor& Actor)
 	return Database->GetLastInsertRowId();
 }
 
+bool FMonolithIndexDatabase::ReplaceActorsForAsset(int64 AssetId, const TArray<FIndexedActor>& Actors)
+{
+	if (!IsOpen() || !BeginTransaction()) return false;
+
+	FSQLitePreparedStatement Stmt;
+	if (!Stmt.Create(*Database, TEXT("DELETE FROM actors WHERE asset_id = ?;")) ||
+		!Stmt.SetBindingValueByIndex(1, AssetId) ||
+		!Stmt.Execute())
+	{
+		if (!RollbackTransaction())
+		{
+			UE_LOG(LogMonolithIndex, Error, TEXT("Actor replacement rollback failed after a delete error"));
+		}
+		return false;
+	}
+
+	for (const FIndexedActor& Actor : Actors)
+	{
+		if (Actor.AssetId != AssetId || InsertActor(Actor) < 0)
+		{
+			if (!RollbackTransaction())
+			{
+				UE_LOG(LogMonolithIndex, Error, TEXT("Actor replacement rollback failed after an insertion error"));
+			}
+			return false;
+		}
+	}
+
+	if (!CommitTransaction())
+	{
+		if (!RollbackTransaction())
+		{
+			UE_LOG(LogMonolithIndex, Error, TEXT("Actor replacement rollback failed after a commit error"));
+		}
+		return false;
+	}
+	return true;
+}
+
 // ============================================================
 // Tag CRUD
 // ============================================================
@@ -1548,6 +1587,11 @@ TSharedPtr<FJsonObject> FMonolithIndexDatabase::GetStats()
 	Stats->SetNumberField(TEXT("configs"), GetCount(TEXT("configs")));
 	Stats->SetNumberField(TEXT("cpp_symbols"), GetCount(TEXT("cpp_symbols")));
 	Stats->SetNumberField(TEXT("datatable_rows"), GetCount(TEXT("datatable_rows")));
+	const FString LevelIndexState = ReadMeta(TEXT("level_index_state"));
+	if (!LevelIndexState.IsEmpty())
+	{
+		Stats->SetStringField(TEXT("level_index_state"), LevelIndexState);
+	}
 
 	// Asset class breakdown
 	auto ClassBreakdown = MakeShared<FJsonObject>();

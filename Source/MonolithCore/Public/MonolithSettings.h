@@ -163,9 +163,9 @@ public:
 		meta=(ClampMin="0", ClampMax="64", ToolTip="0 = auto-detect tier (32+ GB -> 8, 16 GB -> 4, <16 GB -> 2). Set explicitly to override. Lower = less memory, slower indexing."))
 	int32 DeepIndexBatchSize = 0;
 
-	/** Number of assets to process per batch for post-pass indexers (levels, meshes). 0 = auto-detect from installed RAM. These are memory-heavy so use smaller batches. */
+	/** Batch size for bounded post-pass indexers. Level packages always load one at a time. 0 selects a value from installed RAM. */
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Performance", DisplayName="Post-Pass Batch Size",
-		meta=(ClampMin="0", ClampMax="32", ToolTip="0 = auto-detect tier (32+ GB -> 4, 16 GB -> 2, <16 GB -> 1). Set explicitly to override. Lower for large assets."))
+		meta=(ClampMin="0", ClampMax="32", ToolTip="0 = auto-detect tier (32+ GB -> 4, 16 GB -> 2, <16 GB -> 1). Set explicitly to override. Level packages are always loaded one at a time."))
 	int32 PostPassBatchSize = 0;
 
 	/** Run garbage collection every N batches during indexing. Lower values keep memory lower but slow down indexing. */

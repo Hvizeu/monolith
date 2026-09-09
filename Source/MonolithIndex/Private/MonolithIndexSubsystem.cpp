@@ -747,6 +747,7 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	// them would mean one bad asset re-runs the whole index on every launch, which
 	// is the #117 symptom reached from the other direction.
 	TAtomic<bool> bTransactionFailure{false};
+	TAtomic<bool> bLevelPassIncomplete{false};
 	auto RequireTransaction = [&bTransactionFailure](bool bOk, const TCHAR* What) -> bool
 	{
 		if (!bOk)
@@ -1365,9 +1366,9 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	};
 
 	// Helper to check for cancellation
-	auto CheckCancellation = [this]() -> bool
+	auto CheckCancellation = [this, &bLevelPassIncomplete]() -> bool
 	{
-		if (bShouldStop) return true;
+		if (bShouldStop || bLevelPassIncomplete) return true;
 		if (Owner->TaskNotification && Owner->TaskNotification->GetPromptAction() == EAsyncTaskNotificationPromptAction::Cancel)
 		{
 			bShouldStop = true;
@@ -1414,18 +1415,72 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 			double SentinelStart = FPlatformTime::Seconds();
 			UE_LOG(LogMonolithIndex, Log, TEXT("Running level indexer..."));
 			TSharedPtr<IMonolithIndexer> LevelIndexerCopy = *LevelIndexer;
-			if (FLevelIndexer* LevelRaw = static_cast<FLevelIndexer*>(LevelIndexerCopy.Get()))
+			FLevelIndexer* LevelRaw = static_cast<FLevelIndexer*>(LevelIndexerCopy.Get());
+			if (LevelRaw)
 			{
 				LevelRaw->SetIndexedPaths(IndexedPaths);
 			}
-			if (DispatchToGameThreadAndWait(
-				[DB, LevelIndexerCopy, &RunSentinelInTransaction]()
+
+			bool bLevelBegan = false;
+			if (LevelRaw && DispatchToGameThreadAndWait(
+				[DB, LevelIndexerCopy, &bLevelBegan]()
 			{
-				RunSentinelInTransaction(DB, LevelIndexerCopy);
+				bLevelBegan = static_cast<FLevelIndexer*>(LevelIndexerCopy.Get())->BeginIndex(*DB);
 			}))
 			{
-				UE_LOG(LogMonolithIndex, Log, TEXT("Level indexer completed in %.2fs"), FPlatformTime::Seconds() - SentinelStart);
-				GCBetweenIndexers();
+				if (!bLevelBegan)
+				{
+					bTransactionFailure = true;
+					bLevelPassIncomplete = true;
+				}
+				else
+				{
+					while (!CheckCancellation())
+					{
+						EMonolithLevelIndexStepResult StepResult = EMonolithLevelIndexStepResult::Failed;
+						if (!DispatchToGameThreadAndWait(
+							[DB, LevelIndexerCopy, &StepResult]()
+						{
+							StepResult = static_cast<FLevelIndexer*>(LevelIndexerCopy.Get())->ProcessNextWorld(*DB);
+						}))
+						{
+							break;
+						}
+
+						if (StepResult == EMonolithLevelIndexStepResult::Continue)
+						{
+							continue;
+						}
+						if (StepResult == EMonolithLevelIndexStepResult::Degraded)
+						{
+							bLevelPassIncomplete = true;
+							break;
+						}
+						if (StepResult == EMonolithLevelIndexStepResult::Failed)
+						{
+							bTransactionFailure = true;
+							bLevelPassIncomplete = true;
+							break;
+						}
+
+						bool bLevelFinished = false;
+						if (DispatchToGameThreadAndWait(
+							[DB, LevelIndexerCopy, &bLevelFinished]()
+						{
+							bLevelFinished = static_cast<FLevelIndexer*>(LevelIndexerCopy.Get())->FinishIndex(*DB);
+						}) && bLevelFinished)
+						{
+							UE_LOG(LogMonolithIndex, Log, TEXT("Level indexer completed in %.2fs"), FPlatformTime::Seconds() - SentinelStart);
+							GCBetweenIndexers();
+						}
+						else if (!bShouldStop.Load())
+						{
+							bTransactionFailure = true;
+							bLevelPassIncomplete = true;
+						}
+						break;
+					}
+				}
 			}
 		}
 	}
@@ -1588,7 +1643,7 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	//
 	// The old `Indexed < 500` guard is gone with it: it made every project with
 	// fewer than 500 assets re-index from scratch on every single launch.
-	const bool bStructurallyComplete = !bShouldStop.Load() && !bTransactionFailure.Load();
+	const bool bStructurallyComplete = !bShouldStop.Load() && !bTransactionFailure.Load() && !bLevelPassIncomplete.Load();
 	if (bStructurallyComplete)
 	{
 		// Writes last_full_index and clears the in-progress marker in one
@@ -1607,7 +1662,8 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	{
 		UE_LOG(LogMonolithIndex, Warning,
 			TEXT("Index did not complete (%s) — progress is checkpointed and the next launch will resume it"),
-			bShouldStop.Load() ? TEXT("cancelled") : TEXT("transaction failure"));
+			bShouldStop.Load() ? TEXT("cancelled") :
+				bTransactionFailure.Load() ? TEXT("transaction failure") : TEXT("level pass interrupted by memory pressure"));
 	}
 
 	if (bLogMemory)
